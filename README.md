@@ -36,7 +36,7 @@
 - Обучение регрессионных моделей для предсказания уровня успеваемости - `catboost` 
 - Обучение моделей машинного обучения для нахождения аномалий - `scikit-learn`, `pyod`
 - Интерпретация моделей -  `shap`
-- Веб-интерфейс - `gradio`
+- Веб-интерфейс - `streamlit`
 
 ---
 
@@ -73,13 +73,13 @@
     ```bash
     pip install -r requirements.txt
 
-3. Запустите приложение `learning.py` (http://localhost:7861):
+3. Запустите приложение `learning.py`:
     ```bash
-    .\.venv\Scripts\python.exe learning.py
+    streamlit run learning.py
     
-4. Запустите приложение `detection.py` (http://localhost:7860)::
+4. Запустите приложение `detection.py`:
     ```bash
-    .\.venv\Scripts\python.exe detection.py
+    streamlit run detection.py
 
 ---
 
