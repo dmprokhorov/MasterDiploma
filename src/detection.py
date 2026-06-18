@@ -1,42 +1,64 @@
-# detection.py - Детектор аномалий с оптимизацией гиперпараметров и SHAP визуализациями
-import gradio as gr
-
+# streamlit_anomaly_detector.py - Детектор аномалий с оптимизацией гиперпараметров и SHAP визуализациями
+import streamlit as st
 import pandas as pd
 import numpy as np
-
 import matplotlib.pyplot as plt
 import seaborn as sns
-
-sns.set_style('darkgrid')
-
 import optuna
-
 import shap
-
 import torch
-
 from sklearn.svm import OneClassSVM
 from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
+from sklearn.neighbors import LocalOutlierFactor, NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
-
-import sys
+from sklearn.cluster import DBSCAN
+from pyod.models.auto_encoder import AutoEncoder
+from pyod.models.knn import KNN
+from pyod.models.ecod import ECOD
+from pyod.models.copod import COPOD
 import tempfile
-from io import StringIO
-import math
-import re
 import os
+import re
+import time
+import math
+import warnings
 
-# ========== Глобальные переменные ==========
-trained_models = {}
-shap_explanations = {}  # Словарь для хранения SHAP объяснений: {model_key: explained}
-log_capture = StringIO()
+warnings.filterwarnings('ignore')
+
+# Настройка графиков
+sns.set_style('darkgrid')
+plt.rcParams['figure.figsize'] = (12, 6)
+plt.rcParams['font.size'] = 10
+
+# Инициализация состояния сессии
+if 'trained_models' not in st.session_state:
+    st.session_state.trained_models = {}
+if 'shap_explanations' not in st.session_state:
+    st.session_state.shap_explanations = {}
+if 'ensemble_results' not in st.session_state:
+    st.session_state.ensemble_results = None
+if 'data_dict' not in st.session_state:
+    st.session_state.data_dict = None
+if 'loaded' not in st.session_state:
+    st.session_state.loaded = False
+if 'current_file_name' not in st.session_state:
+    st.session_state.current_file_name = None
 
 
-# ========== Метрика качества ==========
+def clear_all_cache():
+    """Полностью очищает все кэши"""
+    st.session_state.trained_models = {}
+    st.session_state.shap_explanations = {}
+    st.session_state.ensemble_results = None
+    st.session_state.data_dict = None
+    st.session_state.loaded = False
+    return "Все кэши очищены"
+
+
+# ==================== МЕТРИКА КАЧЕСТВА ====================
 def anomaly_isolation_ratio_score(X, labels):
-    """Метрика качества для аномалий"""
+    """Метрика качества для аномалий - отношение расстояния аномалий от центра к компактности нормальных"""
     normal = X.iloc[np.where(labels != -1)[0]]
     anomalies = X.iloc[np.where(labels == -1)[0]]
 
@@ -53,17 +75,17 @@ def anomaly_isolation_ratio_score(X, labels):
     return dist_to_center / normal_compactness
 
 
-# ========== Целевая функция для Optuna ==========
-def objective(
-        trial,
-        X,
-        cls,
-        borders=(0.03, 0.05),
-        penalty=0,
-        make_negative=False,
-        **params
-):
-    """Целевая функция для Optuna"""
+def add_score_samples(model, data, indices, attribute='min_samples'):
+    """Добавляет метод score_samples для DBSCAN"""
+    nn = NearestNeighbors(n_neighbors=getattr(model, attribute))
+    nn.fit(data.loc[~data.index.isin(indices)])
+    setattr(model, 'score_samples', lambda y: nn.kneighbors(y)[0].mean(axis=1))
+    return model
+
+
+# ==================== ЕДИНАЯ ЦЕЛЕВАЯ ФУНКЦИЯ ДЛЯ OPTUNA ====================
+def objective(trial, X, cls, borders=(0.03, 0.05), penalty=0, make_negative=False, **params):
+    """Целевая функция для Optuna - единая для всех алгоритмов"""
     trial_params = {}
     for key, value in params.items():
         if isinstance(value, (tuple, list)):
@@ -73,19 +95,9 @@ def objective(
                 log = False
 
             if value[1] == float:
-                trial_params[key] = trial.suggest_float(
-                    key,
-                    value[0][0],
-                    value[0][1],
-                    log=log
-                )
+                trial_params[key] = trial.suggest_float(key, value[0][0], value[0][1], log=log)
             elif value[1] == int:
-                trial_params[key] = trial.suggest_int(
-                    key,
-                    value[0][0],
-                    value[0][1],
-                    log=log
-                )
+                trial_params[key] = trial.suggest_int(key, value[0][0], value[0][1], log=log)
             else:
                 trial_params[key] = trial.suggest_categorical(key, value[0])
         else:
@@ -106,14 +118,7 @@ def objective(
     return anomaly_isolation_ratio_score(X, labels)
 
 
-def capture_optuna_logs(study, trial):
-    """Callback для захвата логов Optuna"""
-    log_capture.write(f"Попытка {trial.number}: значение = {trial.value:.4f}\n")
-    log_capture.write(f"  Параметры: {trial.params}\n")
-    log_capture.write("-" * 50 + "\n")
-
-
-# ========== SHAP функции для визуализации ==========
+# ==================== SHAP ФУНКЦИИ ====================
 def get_shap_explained(attribute, data, indices, type_explainer='Tree', convert=False, **explainer_params):
     """Возвращает SHAP объяснения для аномалий"""
     feature_names = list(data.columns)
@@ -123,397 +128,70 @@ def get_shap_explained(attribute, data, indices, type_explainer='Tree', convert=
         data = torch.FloatTensor(data.values)
         outliers = torch.FloatTensor(outliers)
 
-    explainer = getattr(shap, f'{type_explainer}Explainer')(
-        attribute,
-        data,
-        **explainer_params
-    )
+    explainer = getattr(shap, f'{type_explainer}Explainer')(attribute, data, **explainer_params)
     explained = explainer(outliers)
     explained.feature_names = feature_names
     return explained
 
 
-def shap_summary_plot(explained, data, indices, plot_type='dot', plot_size=(10, 6)):
+def shap_summary_plot(explained, data, indices, plot_type='dot'):
     """Строит summary plot для SHAP"""
-    plt.figure(figsize=plot_size)
-    shap.summary_plot(
-        explained.values,
-        data.iloc[indices],
-        plot_type=plot_type,
-        feature_names=explained.feature_names,
-        max_display=data.shape[1],
-        show=False
-    )
+    plt.figure(figsize=(10, 6))
+    shap.summary_plot(explained.values, data.iloc[indices], plot_type=plot_type,
+                      feature_names=explained.feature_names, max_display=15, show=False)
     plt.tight_layout()
     return plt.gcf()
 
 
-def shap_decision_plot(explained, data, indices, model=None, plot_size=(12, 8)):
+def shap_decision_plot(explained, data, indices):
     """Строит decision plot для SHAP"""
-    plt.figure(figsize=plot_size)
-
-    if model is not None and (not hasattr(explained, 'base_values') or explained.base_values is None):
-        with torch.no_grad():
-            output = model(torch.FloatTensor(data.values)).numpy()
-            explained.base_values = np.square(output - data.values).mean(axis=-1)
-
+    plt.figure(figsize=(12, 6))
     base_value = explained.base_values.mean() if hasattr(explained,
                                                          'base_values') and explained.base_values is not None else 0
-    shap.decision_plot(
-        base_value,
-        explained.values,
-        data.iloc[indices].values,
-        feature_names=data.columns.tolist(),
-        show=False
-    )
+    shap.decision_plot(base_value, explained.values, data.iloc[indices].values,
+                       feature_names=data.columns.tolist(), show=False)
     plt.tight_layout()
     return plt.gcf()
 
 
-def shap_heatmap_plot(explained, plot_size=(12, 8)):
+def shap_heatmap_plot(explained):
     """Строит heatmap для SHAP"""
-    plt.figure(figsize=plot_size)
-
+    plt.figure(figsize=(12, 6))
     if explained.values.ndim > 2:
         explained.values = explained.values.mean(axis=-1)
-
-    shap.plots.heatmap(
-        explained,
-        show=False
-    )
+    shap.plots.heatmap(explained, show=False)
     plt.tight_layout()
     return plt.gcf()
 
 
-# ========== Функция для отображения списка моделей ==========
-def get_trained_models_list():
-    """Возвращает список всех обученных моделей для отображения"""
-    if not trained_models:
-        return []
-
-    models_list = []
-    for key, data in trained_models.items():
-        model_name = f'{key}: {"_".join([f"{k}={v}" for k, v in data["params"].items()])}'
-        n_anomalies = sum(data['predictions'] == -1)
-        models_list.append(f"{model_name} | аномалий: {n_anomalies}")
-
-    return models_list
-
-
-def refresh_predict_models():
-    """Обновляет список моделей для вкладки предсказаний"""
-    models = get_trained_models_list()
-    if not models:
-        return gr.update(choices=[], value=None,
-                         interactive=False), "📭 Нет обученных моделей. Сначала запустите оптимизацию!"
-    else:
-        return gr.update(choices=models, value=models[0] if models else None,
-                         interactive=True), f"✅ Доступно моделей: {len(models)}"
-
-
-def refresh_plot_models():
-    """Обновляет список моделей для вкладки визуализации"""
-    models = get_trained_models_list()
-    if not models:
-        return gr.update(choices=[], value=None,
-                         interactive=False), "📭 Нет обученных моделей. Сначала запустите оптимизацию!"
-    else:
-        return gr.update(choices=models, value=models[0] if models else None,
-                         interactive=True), f"✅ Доступно моделей: {len(models)}"
-
-
-def refresh_ensemble_models():
-    """Обновляет список моделей для вкладки ансамбля"""
-    models = get_trained_models_list()
-    if not models:
-        return gr.update(choices=[], value=[]), "📭 Нет обученных моделей. Сначала запустите оптимизацию!"
-    else:
-        return gr.update(choices=models, value=[]), f"✅ Доступно моделей: {len(models)}. Выберите модели для ансамбля."
-
-
-def show_cached_models():
-    """Показывает информацию о всех обученных моделях в кэше"""
-    if not trained_models:
-        return "📭 Кэш пуст. Сначала запустите оптимизацию."
-
-    result = "🗂️ Кэшированные моде:\n\n"
-    for i, (key, data) in enumerate(trained_models.items(), 1):
-        result += f"{i}. {key}\n"
-        result += f"   Параметры: {data['params']}\n"
-        result += f"   Колонки: {data['columns'][:3]}..."
-        n_anomalies = sum(data['predictions'] == -1)
-        result += f"   Аномалий: {n_anomalies}\n\n"
-
-    result += f"\n📊 Всего моделей в кэше: {len(trained_models)}"
-    return result
-
-
-def clear_cache():
-    """Очищает кэш моделей и SHAP объяснений"""
-    trained_models.clear()
-    shap_explanations.clear()
-    return "🗑️ Кэш моделей и SHAP объяснений очищен!"
-
-
-# ========== Шаг 1: Загрузка данных ==========
-def load_data(file):
-    """Загружает данные, нормализует и очищает кэш"""
-    if file is None:
-        return None, "❌ Файл не выбран", None, None, gr.update(choices=[], value=[]), "❌ Нет данных"
-
-    df = pd.read_csv(file.name, index_col=0)
-    numeric_df = df.select_dtypes(include=[np.number])
-
-    if numeric_df.empty:
-        return None, "❌ Нет числовых колонок!", None, None, gr.update(choices=[], value=[]), "❌ Нет числовых колонок"
-
-    scaler = StandardScaler()
-    normalized_data = scaler.fit_transform(numeric_df)
-    normalized_df = pd.DataFrame(normalized_data, columns=numeric_df.columns, index=df.index)
-
-    available_columns = numeric_df.columns.tolist()
-
-    data_dict = {
-        'original': df,
-        'normalized': normalized_df,
-        'scaler': scaler,
-        'all_columns': available_columns,
-        'selected_columns': available_columns.copy()
-    }
-
-    info = f"✅ Загружено {df.shape[0]} строк, {df.shape[1]} колонок\n"
-    info += f"📊 Числовых колонок: {len(available_columns)}\n"
-    info += f"📊 Нормализация выполнена (StandardScaler)\n"
-    info += f"📊 Доступные колонки: {', '.join(available_columns[:5])}"
-    if len(available_columns) > 5:
-        info += f" и ещё {len(available_columns) - 5}"
-
-    trained_models.clear()
-    shap_explanations.clear()
-    info += "\n\n🔄 Кэш моделей и SHAP объяснений очищен"
-
-    return data_dict, info, df.head(), normalized_df[available_columns].head(), gr.update(choices=available_columns,
-                                                                                          value=available_columns), f"✅ Выбрано колонок: {len(available_columns)}"
-
-
-def update_selected_columns(data_dict, columns):
-    """Обновляет список выбранных колонок и показывает нормализованные данные"""
-    if data_dict is None:
-        return data_dict, "❌ Нет данных", None
-
-    if not columns:
-        return data_dict, "⚠️ Не выбрано ни одной колонки!", None
-
-    data_dict['selected_columns'] = columns
-    normalized_preview = data_dict['normalized'][columns].head()
-    trained_models.clear()
-    shap_explanations.clear()
-
-    return data_dict, f"✅ Выбрано колонок: {len(columns)} (кэш очищен)", normalized_preview
-
-
-# ========== Шаг 2: Оптимизация и обучение ==========
-def run_optimization(
-        data_dict,
-        cls,
-        n_trials,
-        borders_low,
-        borders_high,
-        penalty,
-        log_callback=None,
-        **params
-):
-    """Запускает оптимизацию гиперпараметров и сохраняет лучшую модель"""
-    if data_dict is None:
-        return "❌ Сначала загрузите данные!", None, None, ""
-
-    selected_columns = data_dict.get('selected_columns', [])
-    if not selected_columns:
-        return "❌ Выберите колонки для обучения!", None, None, ""
-
-    X = data_dict['normalized'][selected_columns].copy()
-    default_params = {
-        key: value for key, value in params.items()
-        if not isinstance(value, (tuple, list))
-    }
-
-    # Очищаем буфер логов
-    log_capture.truncate(0)
-    log_capture.seek(0)
-
-    # Перенаправляем stdout для захвата вывода Optuna
-    old_stdout = sys.stdout
-    sys.stdout = log_capture
-
-    try:
-        study = optuna.create_study(
-            direction='maximize',
-            study_name=f'Оптимизация алгоритма {cls.__name__}'
-        )
-
-        def objective_wrapper(trial):
-            return objective(
-                trial,
-                X=X,
-                cls=cls,
-                borders=(borders_low, borders_high),
-                penalty=penalty,
-                make_negative=False,
-                **params
-            )
-
-        study.optimize(
-            objective_wrapper,
-            n_trials=int(n_trials),
-            callbacks=[capture_optuna_logs],
-            show_progress_bar=True
-        )
-
-        logs = log_capture.getvalue()
-
-    finally:
-        sys.stdout = old_stdout
-
-    # Обновляем лог в интерфейсе
-    if log_callback:
-        log_callback(logs)
-
-    best_params = study.best_params
-    final_params = {**best_params, **default_params}
-
-    model = cls(**final_params)
-    predictions = model.fit_predict(X)
+# ==================== ФУНКЦИИ ВИЗУАЛИЗАЦИИ ====================
+def create_pca_plot(data, predictions, model_name, indices=None):
+    """Строит график PCA для визуализации аномалий с подписями"""
+    fig, ax = plt.subplots(figsize=(12, 8))
 
     n_anomalies = sum(predictions == -1)
-    anomaly_indices = np.where(predictions == -1)[0].tolist()
-    score = anomaly_isolation_ratio_score(X, predictions)
+    n_normal = len(predictions) - n_anomalies
 
-    # Для LOF создаём дополнительную модель с novelty=True
-    novelty_model = None
-    if cls.__name__ == "LocalOutlierFactor":
-        novelty_model = LocalOutlierFactor(**final_params, novelty=True)
-        novelty_model.fit(X)
-
-    # Сохраняем только одну модель на класс (затираем старую)
-    model_key = cls.__name__
-    trained_models[model_key] = {
-        'model': model,
-        'novelty_model': novelty_model,
-        'predictions': predictions,
-        'params': final_params,
-        'columns': selected_columns.copy(),
-        'anomaly_indices': anomaly_indices
-    }
-
-    # Удаляем старые SHAP объяснения для этого алгоритма
-    if model_key in shap_explanations:
-        del shap_explanations[model_key]
-
-    result = f"🏆 Оптимизация завершена!\n\n"
-    result += f"📊 Лучшие параметры:\n"
-    for key, value in best_params.items():
-        result += f"   {key}: {value}\n"
-    result += f"\n📈 Лучшее значение метрики: {score:.4f}\n"
-    result += f"🔴 Найдено аномалий: {n_anomalies} ({n_anomalies / len(X) * 100:.1f}%)\n"
-    result += f"📋 Индексы аномалий (первые 20): {anomaly_indices[:20]}\n"
-    result += f"\n📊 Количество попыток: {n_trials}"
-
-    params_text = "\n".join([f"{k}: {v}" for k, v in best_params.items()])
-
-    return result, params_text, score, logs
-
-
-# ========== Шаг 3: Предсказания ==========
-def get_predictions_from_selected_model(data_dict, selected_model_display):
-    """Возвращает предсказания для выбранной модели"""
-    if data_dict is None:
-        return "❌ Сначала загрузите данные!"
-
-    if not selected_model_display:
-        return "❌ Выберите модель из списка!"
-
-    selected_key = None
-    for key, data in trained_models.items():
-        model_name = f'{key}: {"_".join([f"{k}={v}" for k, v in data["params"].items()])}'
-        model_display = f"{model_name} | аномалий: {sum(data['predictions'] == -1)}"
-
-        if model_display == selected_model_display:
-            selected_key = key
-            break
-
-    if selected_key is None:
-        return "❌ Модель не найдена в кэше!"
-
-    model_data = trained_models[selected_key]
-    predictions = model_data['predictions']
-    params = model_data['params']
-    df = data_dict['original']
-
-    anomaly_mask = predictions == -1
-    n_anomalies = sum(anomaly_mask)
-    anomaly_indices = np.where(anomaly_mask)[0].tolist()
-    normal_indices = np.where(predictions == 1)[0].tolist()
-
-    result = f"🔍 Модель: {selected_key}\n"
-    result += f"⚙️ Параметры: {params}\n"
-    result += f"📊 Колонки: {model_data['columns'][:5]}"
-    if len(model_data['columns']) > 5:
-        result += f" и ещё {len(model_data['columns']) - 5}\n"
-    else:
-        result += "\n"
-    result += f"\n📊 Результаты предсказания:\n"
-    result += f"   ✅ Нормальные: {len(normal_indices)} ({len(normal_indices) / len(df) * 100:.1f}%)\n"
-    result += f"   🔴 Аномалии: {n_anomalies} ({n_anomalies / len(df) * 100:.1f}%)\n"
-
-    result += f"\n📋 Индексы аномалий (первые 30):\n"
-    if anomaly_indices:
-        result += f"   {anomaly_indices[:30]}"
-        if len(anomaly_indices) > 30:
-            result += f"\n   ... и ещё {len(anomaly_indices) - 30}"
-    else:
-        result += f"   Аномалий не найдено"
-
-    return result
-
-
-# ========== Шаг 4: Визуализация ==========
-def get_model_data(selected_model_display):
-    """Получает данные модели по отображаемому имени"""
-    for key, data in trained_models.items():
-        model_name = f'{key}: {"_".join([f"{k}={v}" for k, v in data["params"].items()])}'
-        model_display = f"{model_name} | аномалий: {sum(data['predictions'] == -1)}"
-        if model_display == selected_model_display:
-            return key, data
-    return None, None
-
-
-def create_pca_plot(data_dict, selected_model_display):
-    """Строит график PCA для выбранной модели"""
-    if data_dict is None:
-        return None, "❌ Сначала загрузите данные!"
-
-    if not selected_model_display:
-        return None, "❌ Выберите модель из списка!"
-
-    model_key, model_data = get_model_data(selected_model_display)
-    if model_key is None:
-        return None, "❌ Модель не найдена!"
-
-    predictions = model_data['predictions']
-    model_columns = model_data['columns']
-    normalized_df = data_dict['normalized'][model_columns].copy()
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    if normalized_df.shape[1] >= 2:
+    if data.shape[1] >= 2:
         pca = PCA(n_components=2)
-        data_2d = pca.fit_transform(normalized_df)
+        data_2d = pca.fit_transform(data)
 
-        normal = data_2d[predictions == 1]
+        normal = data_2d[predictions != -1]
         anomalies = data_2d[predictions == -1]
 
-        ax.scatter(normal[:, 0], normal[:, 1], c='blue', label='Нормальные', alpha=0.6, s=50)
-        ax.scatter(anomalies[:, 0], anomalies[:, 1], c='red', label='Аномалии', marker='x', s=100, linewidths=2)
+        anomaly_indices = np.where(predictions == -1)[0]
+        anomaly_labels = data.index[anomaly_indices].tolist() if indices is None else indices[anomaly_indices].tolist()
+
+        # Рисуем нормальные точки (одна легенда)
+        ax.scatter(normal[:, 0], normal[:, 1], c='blue', label=f'Нормальные ({n_normal})', alpha=0.4, s=30)
+
+        # Рисуем все аномалии без легенды для каждой
+        for i, (x, y, label) in enumerate(zip(anomalies[:, 0], anomalies[:, 1], anomaly_labels)):
+            ax.scatter(x, y, c='red', marker='x', s=100, linewidths=2, zorder=5)
+            ax.annotate(str(label), (x, y), xytext=(5, 5), textcoords='offset points',
+                        fontsize=8, alpha=0.8, color='darkred', weight='bold')
+
+        ax.scatter([], [], c='red', marker='x', s=100, linewidths=2, label=f'Аномалии ({n_anomalies})')
 
         ax.set_xlabel('Первая главная компонента')
         ax.set_ylabel('Вторая главная компонента')
@@ -521,287 +199,455 @@ def create_pca_plot(data_dict, selected_model_display):
         ax.plot(predictions, 'o-', markersize=4)
         ax.axhline(y=0, color='red', linestyle='--', linewidth=2)
         ax.fill_between(range(len(predictions)), -1, 1, where=(predictions == -1), color='red', alpha=0.3)
+
+        anomaly_indices = np.where(predictions == -1)[0]
+        anomaly_labels = data.index[anomaly_indices].tolist() if indices is None else indices[anomaly_indices].tolist()
+
+        for idx, label in zip(anomaly_indices, anomaly_labels):
+            ax.annotate(str(label), (idx, -0.5), fontsize=8, alpha=0.8,
+                        color='darkred', rotation=45, ha='right')
+
+        # Легенда для одномерного графика
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=8,
+                   label=f'Нормальные ({n_normal})'),
+            Line2D([0], [0], marker='x', color='red', markersize=8, label=f'Аномалии ({n_anomalies})')
+        ]
+        ax.legend(handles=legend_elements)
+
         ax.set_xlabel('Индекс образца')
         ax.set_ylabel('Предсказание (1=норма, -1=аномалия)')
 
-    n_anomalies = sum(predictions == -1)
-    ax.set_title(f'{model_key}\nКолонки: {model_columns[:3]}...\nАномалий: {n_anomalies}')
+    ax.set_title(f'{model_name}')
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-
-    return fig, f"✅ График PCA для модели: {selected_model_display}"
-
-
-def create_shap_plot(data_dict, selected_model_display, plot_type, summary_plot_type='dot'):
-    """Создаёт SHAP график для выбранной модели"""
-    if data_dict is None:
-        return None, "❌ Сначала загрузите данные!"
-
-    if not selected_model_display:
-        return None, "❌ Выберите модель из списка!"
-
-    model_key, model_data = get_model_data(selected_model_display)
-    if model_key is None:
-        return None, "❌ Модель не найдена!"
-
-    # Определяем тип объяснителя для алгоритма
-    if model_key == "OneClassSVM":
-        type_explainer = 'Kernel'
-    elif model_key == "IsolationForest":
-        type_explainer = 'Tree'
-    else:  # LocalOutlierFactor
-        type_explainer = 'Kernel'
-
-    # Получаем данные
-    X = data_dict['normalized'][model_data['columns']].copy()
-    anomaly_indices = model_data['anomaly_indices']
-
-    if len(anomaly_indices) == 0:
-        return None, "⚠️ Нет аномалий для объяснения!"
-
-    # Проверяем, есть ли уже сохранённые объяснения
-    if model_key in shap_explanations:
-        explained = shap_explanations[model_key]
-    else:
-        # Выбираем модель для атрибута
-        if model_key == "LocalOutlierFactor" and model_data.get('novelty_model') is not None:
-            attribute_model = model_data['novelty_model']
-        else:
-            attribute_model = model_data['model']
-
-        # Получаем атрибут (метод score_samples)
-        if model_key == "IsolationForest":
-            attribute = attribute_model
-        elif hasattr(attribute_model, 'score_samples'):
-            attribute = attribute_model.score_samples
-        else:
-            attribute = attribute_model.decision_function
-
-        # Вычисляем SHAP объяснения
-        explained = get_shap_explained(
-            attribute=attribute,
-            data=X,
-            indices=anomaly_indices,
-            type_explainer=type_explainer,
-            convert=(type_explainer == 'Deep')
-        )
-        shap_explanations[model_key] = explained
-
-    # Создаём график в зависимости от типа
-    if plot_type == 'summary':
-        fig = shap_summary_plot(explained, X, anomaly_indices, summary_plot_type)
-        return fig, f"✅ SHAP summary plot ({summary_plot_type}) для модели: {selected_model_display}"
-    elif plot_type == 'decision':
-        fig = shap_decision_plot(explained, X, anomaly_indices, model=None)
-        return fig, f"✅ SHAP decision plot для модели: {selected_model_display}"
-    elif plot_type == 'heatmap':
-        fig = shap_heatmap_plot(explained)
-        return fig, f"✅ SHAP heatmap для модели: {selected_model_display}"
-    else:
-        return None, f"❌ Неизвестный тип графика: {plot_type}"
-
-
-# ========== Шаг 4: Визуализация ==========
-# ========== Функции для визуализации распределений аномалий ==========
-def plot_numerical_distributions(
-        data,
-        indices,
-        columns,
-        figsize=(18, 10),
-        palette='rocket'
-):
-    """Строит гистограммы для численных признаков аномалий"""
-    if len(columns) == 0:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.text(0.5, 0.5, "Нет числовых признаков для отображения",
-                ha='center', va='center', fontsize=14)
-        ax.axis('off')
-        plt.tight_layout()
-        return fig
-
-    ncols = min(int(math.ceil(len(columns) ** 0.5)), 4)
-    nrows = max(1, math.ceil(len(columns) / ncols))
-
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
-
-    # Преобразуем axes в плоский список для удобства
-    if nrows == 1 and ncols == 1:
-        axes = [axes]
-    else:
-        axes = axes.flatten()
-
-    for i, column in enumerate(columns):
-        if i < len(axes):
-            import seaborn as sns
-            sns.histplot(
-                data.iloc[indices][column],
-                kde=True,
-                color='red',
-                alpha=0.6,
-                ax=axes[i]
-            )
-            axes[i].set_xlabel(None)
-            axes[i].set_title(column, fontsize=10)
-
-    # Скрываем лишние подграфики
-    for j in range(len(columns), len(axes)):
-        axes[j].axis('off')
-
-    plt.suptitle(f'Распределение числовых признаков среди аномалий (n={len(indices)})', fontsize=14)
-    plt.tight_layout()
     return fig
 
 
-def plot_categorical_distributions(
-        data,
-        indices,
-        columns,
-        figsize=(18, 10),
-        palette='rocket'
-):
-    """Строит столбчатые диаграммы для категориальных признаков аномалий"""
-    if len(columns) == 0:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.text(0.5, 0.5, "Нет категориальных признаков для отображения",
-                ha='center', va='center', fontsize=14)
-        ax.axis('off')
-        plt.tight_layout()
-        return fig
-
-    ncols = min(int(math.ceil(len(columns) ** 0.5)), 4)
-    nrows = max(1, math.ceil(len(columns) / ncols))
-
-    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=figsize)
-
-    if nrows == 1 and ncols == 1:
-        axes = [axes]
-    else:
-        axes = axes.flatten()
-
-    for i, column in enumerate(columns):
-        if i < len(axes):
-            import seaborn as sns
-            value_counts = data.iloc[indices][column].value_counts()
-            colors = sns.color_palette(palette, len(value_counts))
-
-            bars = axes[i].bar(range(len(value_counts)), value_counts.values, color=colors, alpha=0.7)
-            axes[i].set_xticks(range(len(value_counts)))
-            axes[i].set_xticklabels(value_counts.index, rotation=45, ha='right', fontsize=8)
-            axes[i].set_title(column, fontsize=10)
-            axes[i].set_ylabel('Количество')
-
-            # Добавляем подписи на столбцах
-            for bar, val in zip(bars, value_counts.values):
-                axes[i].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                             str(val), ha='center', va='bottom', fontsize=8)
-
-    # Скрываем лишние подграфики
-    for j in range(len(columns), len(axes)):
-        axes[j].axis('off')
-
-    plt.suptitle(f'Распределение категориальных признаков среди аномалий (n={len(indices)})', fontsize=14)
-    plt.tight_layout()
-    return fig
-
-
-def plot_scores(model, data, indices, method='score_samples', figsize=(14, 8)):
+def plot_scores(model, data, indices, method='score_samples'):
     """Строит точечную диаграмму значений выбросности объектов"""
-    fig, ax = plt.subplots(figsize=figsize)
+    fig, ax = plt.subplots(figsize=(14, 6))
 
-    scores = pd.Series(
-        getattr(model, method)(data),
-        index=data.index
-    )
+    scores = pd.Series(getattr(model, method)(data), index=data.index)
 
-    # Аномалии (оранжевые)
-    ax.scatter(
-        indices,
-        scores.iloc[indices],
-        color='orange',
-        label='Аномалии',
-        s=50,
-        alpha=0.7
-    )
-
-    # Нормальные объекты (синие)
+    ax.scatter(indices, scores.iloc[indices], color='red', label='Аномалии', s=50, alpha=0.7)
     normal_indices = np.delete(range(data.shape[0]), indices)
-    ax.scatter(
-        normal_indices,
-        scores.iloc[normal_indices],
-        color='blue',
-        label='Норма',
-        s=30,
-        alpha=0.5
-    )
+    ax.scatter(normal_indices, scores.iloc[normal_indices], color='blue', label='Норма', s=30, alpha=0.5)
 
     ax.set_xlabel('Индекс объекта', fontsize=12)
     ax.set_ylabel('Значение "выбросности" (score)', fontsize=12)
-    ax.set_title(f'Точечная диаграмма значений "выбросности" объектов', fontsize=14)
+    ax.set_title('Точечная диаграмма значений "выбросности" объектов', fontsize=14)
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
 
 
-def create_score_plot(data_dict, selected_model_display):
-    """Создаёт график выбросности для выбранной модели"""
+def plot_numerical_distributions(data, indices, columns):
+    """Строит гистограммы для численных признаков аномалий"""
+    if len(columns) == 0:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "Нет числовых признаков", ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        return fig
+
+    ncols = min(int(math.ceil(len(columns) ** 0.5)), 4)
+    nrows = max(1, math.ceil(len(columns) / ncols))
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(18, 5 * nrows))
+    axes = axes.flatten() if nrows > 1 or ncols > 1 else [axes]
+
+    for i, col in enumerate(columns):
+        if i < len(axes):
+            sns.histplot(data.iloc[indices][col], kde=True, color='red', alpha=0.6, ax=axes[i])
+            axes[i].set_title(col, fontsize=10)
+            axes[i].set_xlabel(None)
+
+    for j in range(len(columns), len(axes)):
+        axes[j].axis('off')
+
+    plt.suptitle(f'Распределение числовых признаков среди аномалий (n={len(indices)})', fontsize=14, y=1.01)
+    plt.tight_layout()
+    return fig
+
+
+def plot_categorical_distributions(data, indices, columns):
+    """Строит столбчатые диаграммы для категориальных признаков аномалий"""
+    if len(columns) == 0:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.text(0.5, 0.5, "Нет категориальных признаков", ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        return fig
+
+    ncols = min(int(math.ceil(len(columns) ** 0.5)), 4)
+    nrows = max(1, math.ceil(len(columns) / ncols))
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(18, 5 * nrows))
+    axes = axes.flatten() if nrows > 1 or ncols > 1 else [axes]
+
+    for i, col in enumerate(columns):
+        if i < len(axes):
+            value_counts = data.iloc[indices][col].value_counts()
+            colors = sns.color_palette('rocket', len(value_counts))
+            bars = axes[i].bar(range(len(value_counts)), value_counts.values, color=colors, alpha=0.7)
+            axes[i].set_xticks(range(len(value_counts)))
+            axes[i].set_xticklabels(value_counts.index, rotation=45, ha='right', fontsize=8)
+            axes[i].set_title(col, fontsize=10)
+            axes[i].set_ylabel('Количество')
+            for bar, val in zip(bars, value_counts.values):
+                axes[i].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, str(val), ha='center',
+                             va='bottom', fontsize=8)
+
+    for j in range(len(columns), len(axes)):
+        axes[j].axis('off')
+
+    plt.suptitle(f'Распределение категориальных признаков среди аномалий (n={len(indices)})', fontsize=14, y=1.01)
+    plt.tight_layout()
+    return fig
+
+
+# ==================== ФУНКЦИИ ЗАГРУЗКИ ДАННЫХ ====================
+def load_cluster_data(file):
+    """Загружает данные кластера"""
+    if file is None:
+        return None, "Файл не выбран", None
+
+    try:
+        df = pd.read_csv(file, index_col=0)
+
+        exclude_cols = ['cluster']
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        available_cols = [col for col in numeric_cols if col not in exclude_cols]
+
+        data_dict = {
+            'original': df,
+            'normalized': None,
+            'scaler': None,
+            'all_columns': available_cols,
+            'selected_columns': available_cols.copy()
+        }
+
+        return data_dict, f"Загружен файл: {df.shape[0]} строк, {len(available_cols)} числовых колонок", df.head()
+
+    except Exception as e:
+        return None, f"Ошибка загрузки: {str(e)}", None
+
+
+def normalize_data(data_dict, selected_columns):
+    """Нормализует выбранные колонки"""
+    if data_dict is None or not selected_columns:
+        return data_dict
+
+    df = data_dict['original']
+    scaler = StandardScaler()
+    normalized_data = scaler.fit_transform(df[selected_columns])
+    normalized_df = pd.DataFrame(normalized_data, columns=selected_columns, index=df.index)
+
+    data_dict['normalized'] = normalized_df
+    data_dict['scaler'] = scaler
+    data_dict['selected_columns'] = selected_columns
+
+    return data_dict
+
+
+# ==================== ФУНКЦИИ ОПТИМИЗАЦИИ ====================
+def run_optimization(data_dict, algorithm, params_config, log_placeholder):
+    """Запускает оптимизацию гиперпараметров с обновляющимся логом"""
     if data_dict is None:
-        return None, "❌ Сначала загрузите данные!"
+        return "Сначала загрузите данные!", None, 0
 
-    if not selected_model_display:
-        return None, "❌ Выберите модель из списка!"
+    selected_columns = data_dict.get('selected_columns', [])
+    if not selected_columns:
+        return "Выберите колонки для обучения!", None, 0
 
-    model_key, model_data = get_model_data(selected_model_display)
-    if model_key is None:
-        return None, "❌ Модель не найдена!"
+    X = data_dict['normalized'][selected_columns].copy()
 
-    # Получаем данные
+    if algorithm in ["AutoEncoder", "KNN", "COPOD", "ECOD"]:
+        make_negative = True
+    else:
+        make_negative = False
+
+    if algorithm == "OneClassSVM":
+        params = {
+            'nu': ((params_config['nu_min'], params_config['nu_max']), float, params_config['nu_log']),
+            'kernel': 'rbf'
+        }
+        cls = OneClassSVM
+    elif algorithm == "IsolationForest":
+        params = {
+            'n_estimators': ((params_config['n_min'], params_config['n_max']), int, params_config['n_log']),
+            'max_samples': ((params_config['samples_min'], params_config['samples_max']), float,
+                            params_config['samples_log']),
+            'contamination': ((params_config['cont_min'], params_config['cont_max']), float, params_config['cont_log']),
+            'n_jobs': -1,
+            'random_state': 42
+        }
+        cls = IsolationForest
+    elif algorithm == "LocalOutlierFactor":
+        params = {
+            'n_neighbors': ((params_config['n_min'], params_config['n_max']), int, params_config['n_log']),
+            'contamination': ((params_config['cont_min'], params_config['cont_max']), float, params_config['cont_log']),
+            'metric': params_config['metric'],
+            'n_jobs': -1
+        }
+        cls = LocalOutlierFactor
+    elif algorithm == "DBSCAN":
+        params = {
+            'eps': ((params_config['eps_min'], params_config['eps_max']), float, params_config['eps_log']),
+            'min_samples': ((params_config['ms_min'], params_config['ms_max']), int, params_config['ms_log']),
+            'metric': params_config['metric'],
+            'n_jobs': -1
+        }
+        cls = DBSCAN
+    elif algorithm == "AutoEncoder":
+        params = {
+            'lr': ((params_config['lr_min'], params_config['lr_max']), float, params_config['lr_log']),
+            'epoch_num': ((params_config['ep_min'], params_config['ep_max']), int, params_config['ep_log']),
+            'dropout_rate': ((params_config['dr_min'], params_config['dr_max']), float, params_config['dr_log']),
+            'contamination': ((params_config['cont_min'], params_config['cont_max']), float, params_config['cont_log']),
+            'verbose': False,
+            'random_state': 42
+        }
+        cls = AutoEncoder
+    elif algorithm == "KNN":
+        params = {
+            'n_neighbors': ((params_config['nn_min'], params_config['nn_max']), int, params_config['nn_log']),
+            'contamination': ((params_config['cont_min'], params_config['cont_max']), float, params_config['cont_log']),
+            'method': params_config['method'],
+            'metric': params_config['metric'],
+            'n_jobs': -1
+        }
+        cls = KNN
+    elif algorithm == "COPOD":
+        params = {
+            'contamination': ((params_config['cont_min'], params_config['cont_max']), float, params_config['cont_log']),
+            'n_jobs': -1
+        }
+        cls = COPOD
+    elif algorithm == "ECOD":
+        params = {
+            'contamination': ((params_config['cont_min'], params_config['cont_max']), float, params_config['cont_log']),
+            'n_jobs': -1
+        }
+        cls = ECOD
+
+    study = optuna.create_study(direction='maximize', study_name=f'Optuna_{algorithm}')
+
+    best_value = -float('inf')
+    best_trial_number = None
+    best_params_str = ""
+
+    def objective_wrapper(trial):
+        nonlocal best_value, best_trial_number, best_params_str
+        result = objective(
+            trial, X, cls,
+            (params_config['borders_low'], params_config['borders_high']),
+            params_config['penalty'],
+            make_negative,
+            **params
+        )
+
+        is_best = result > best_value
+        if is_best:
+            best_value = result
+            best_trial_number = trial.number + 1
+            best_params_str = f"метрика={best_value:.4f}"
+
+        log_text = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║                    ОПТИМИЗАЦИЯ ГИПЕРПАРАМЕТРОВ                   ║
+║                        {algorithm}                               ║
+╚══════════════════════════════════════════════════════════════════╝
+
+ТЕКУЩАЯ ИТЕРАЦИЯ:
+   Попытка: {trial.number + 1} / {params_config['n_trials']}
+   Метрика: {result:.4f}
+   {' НОВЫЙ ЛУЧШИЙ!' if is_best else ''}
+
+ПАРАМЕТРЫ ТЕКУЩЕЙ ПОПЫТКИ:
+{chr(10).join([f'   {k}: {v}' for k, v in trial.params.items()])}
+
+ЛУЧШИЙ РЕЗУЛЬТАТ:
+   Попытка #{best_trial_number if best_trial_number else 'Н/Д'}
+   {best_params_str}
+
+{'─' * 70}
+"""
+        log_placeholder.code(log_text, language="text")
+        time.sleep(0.05)
+
+        return result
+
+    study.optimize(objective_wrapper, n_trials=params_config['n_trials'], show_progress_bar=False)
+
+    best_params = study.best_params
+    best_value = study.best_value
+
+    final_log = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║                    ОПТИМИЗАЦИЯ ЗАВЕРШЕНА                         ║
+╚══════════════════════════════════════════════════════════════════╝
+
+ЛУЧШИЕ ПАРАМЕТРЫ:
+{chr(10).join([f'   {k}: {v}' for k, v in best_params.items()])}
+
+ЛУЧШЕЕ ЗНАЧЕНИЕ МЕТРИКИ: {best_value:.4f}
+
+{'─' * 70}
+"""
+    log_placeholder.code(final_log, language="text")
+
+    final_model = cls(**best_params)
+    predictions = final_model.fit_predict(X)
+    if make_negative:
+        predictions *= -1
+
+    n_anomalies = sum(predictions == -1)
+    anomaly_indices = np.where(predictions == -1)[0].tolist()
+    score = anomaly_isolation_ratio_score(X, predictions)
+
+    if algorithm == "DBSCAN":
+        final_model = add_score_samples(final_model, X, anomaly_indices)
+
+    novelty_model = None
+    if algorithm == "LocalOutlierFactor":
+        novelty_model = LocalOutlierFactor(**best_params, novelty=True, n_jobs=-1)
+        novelty_model.fit(X)
+
+    st.session_state.trained_models[algorithm] = {
+        'model': final_model,
+        'novelty_model': novelty_model,
+        'predictions': predictions,
+        'params': best_params,
+        'columns': selected_columns.copy(),
+        'anomaly_indices': anomaly_indices,
+        'score': score,
+        'n_anomalies': n_anomalies
+    }
+
+    if algorithm in st.session_state.shap_explanations:
+        del st.session_state.shap_explanations[algorithm]
+
+    result_text = f"""
+ОПТИМИЗАЦИЯ ЗАВЕРШЕНА!
+
+ЛУЧШИЕ ПАРАМЕТРЫ:
+{chr(10).join([f'   {k}: {v}' for k, v in best_params.items()])}
+
+ЛУЧШЕЕ ЗНАЧЕНИЕ МЕТРИКИ: {score:.4f}
+НАЙДЕНО АНОМАЛИЙ: {n_anomalies} ({n_anomalies / len(X) * 100:.1f}%)
+ИНДЕКСЫ АНОМАЛИЙ (ПЕРВЫЕ 20): {anomaly_indices[:20]}"""
+
+    return result_text, best_params, score
+
+
+# ==================== ФУНКЦИИ ВИЗУАЛИЗАЦИИ МОДЕЛЕЙ ====================
+def get_trained_models_list():
+    """Возвращает список обученных моделей"""
+    if not st.session_state.trained_models:
+        return []
+    return list(st.session_state.trained_models.keys())
+
+
+def create_plot(data_dict, model_name, plot_type, summary_plot_type='dot'):
+    """Создает график для выбранной модели"""
+    if data_dict is None:
+        return None, "Сначала загрузите данные!"
+
+    if model_name not in st.session_state.trained_models:
+        return None, f"Модель {model_name} не найдена!"
+
+    model_data = st.session_state.trained_models[model_name]
     X = data_dict['normalized'][model_data['columns']].copy()
+    predictions = model_data['predictions']
     anomaly_indices = model_data['anomaly_indices']
 
-    if len(anomaly_indices) == 0:
-        return None, "⚠️ Нет аномалий для отображения!"
+    if plot_type == "PCA":
+        fig = create_pca_plot(X, predictions, model_name, X.index)
+        return fig, None
+    elif plot_type == "Score Plot":
+        if len(anomaly_indices) == 0:
+            return None, "Нет аномалий для отображения!"
 
-    # Выбираем модель для получения scores
-    model = model_data['model']
-    if model_key == 'LocalOutlierFactor':
-        model = model_data['novelty_model']
-    method = 'score_samples' if hasattr(model, 'score_samples') else 'decision_function'
+        model = model_data['model']
+        if model_name == 'LocalOutlierFactor' and model_data.get('novelty_model') is not None:
+            model = model_data['novelty_model']
 
-    fig = plot_scores(model, X, anomaly_indices, method=method)
-    return fig, f"✅ График выбросности для модели: {selected_model_display}"
+        method = 'score_samples' if hasattr(model, 'score_samples') else 'decision_function'
+        fig = plot_scores(model, X, anomaly_indices, method)
+
+        ax = fig.axes[0]
+        anomaly_labels = X.index[anomaly_indices].tolist()
+        for idx, label in zip(anomaly_indices[:20], anomaly_labels[:20]):
+            ax.annotate(str(label), (idx, 0), xytext=(5, 5), textcoords='offset points',
+                        fontsize=7, alpha=0.7, color='darkred')
+        plt.tight_layout()
+
+        return fig, None
+    elif plot_type.startswith("SHAP"):
+        if len(anomaly_indices) == 0:
+            return None, "Нет аномалий для SHAP объяснений!"
+
+        if model_name == "IsolationForest":
+            type_explainer = 'Tree'
+        elif model_name == "AutoEncoder":
+            type_explainer = 'Deep'
+        elif model_name in ("KNN", "ECOD", "COPOD"):
+            type_explainer = 'Permutation'
+        else:
+            type_explainer = 'Kernel'
+
+        if model_name in st.session_state.shap_explanations:
+            explained = st.session_state.shap_explanations[model_name]
+        else:
+            if model_name == "LocalOutlierFactor" and model_data.get('novelty_model') is not None:
+                attribute_model = model_data['novelty_model']
+            else:
+                attribute_model = model_data['model']
+
+            if model_name == "IsolationForest":
+                attribute = attribute_model
+            elif model_name == "AutoEncoder":
+                attribute = attribute_model.model
+            elif hasattr(attribute_model, 'score_samples'):
+                attribute = attribute_model.score_samples
+            else:
+                attribute = attribute_model.decision_function
+
+            explained = get_shap_explained(attribute, X, anomaly_indices, type_explainer,
+                                           convert=(type_explainer == 'Deep'))
+            st.session_state.shap_explanations[model_name] = explained
+
+        if plot_type == "SHAP Summary":
+            fig = shap_summary_plot(explained, X, anomaly_indices, summary_plot_type)
+            fig.axes[0].set_title(f'SHAP Summary - {model_name}\nАномалии: {len(anomaly_indices)} объектов',
+                                  fontsize=12)
+            return fig, None
+        elif plot_type == "SHAP Decision":
+            fig = shap_decision_plot(explained, X, anomaly_indices)
+            fig.axes[0].set_title(f'SHAP Decision - {model_name}\nАномалии: {len(anomaly_indices)} объектов',
+                                  fontsize=12)
+            return fig, None
+        elif plot_type == "SHAP Heatmap":
+            fig = shap_heatmap_plot(explained)
+            return fig, None
+
+    return None, "Неизвестный тип графика"
 
 
-# ========== Шаг 5: Ансамбль аномалий ==========
-def ensemble_prediction(data_dict, selected_models_display, threshold, show_numerical, show_categorical):
-    """Выполняет ансамблевое предсказание и сохраняет результаты в state"""
+# ==================== ФУНКЦИИ АНСАМБЛЯ ====================
+def ensemble_prediction(data_dict, selected_models, threshold, show_numerical, show_categorical):
+    """Выполняет ансамблевое предсказание"""
     if data_dict is None:
-        return "❌ Сначала загрузите данные!", "", None, None, None, "❌ Нет данных", None
+        return "Сначала загрузите данные!", "", None, None, None
 
-    if not selected_models_display:
-        return "❌ Выберите хотя бы одну модель!", "", None, None, None, "❌ Модели не выбраны", None
+    if not selected_models:
+        return "Выберите хотя бы одну модель!", "", None, None, None
 
-    # Находим модели по отображаемым именам
-    selected_keys = []
-    for display_name in selected_models_display:
-        for key, data in trained_models.items():
-            model_name = f'{key}: {"_".join([f"{k}={v}" for k, v in data["params"].items()])}'
-            model_display = f"{model_name} | аномалий: {sum(data['predictions'] == -1)}"
-            if model_display == display_name:
-                selected_keys.append(key)
-                break
-
-    if not selected_keys:
-        return "❌ Выбранные модели не найдены в кэше!", "", None, None, None, "❌ Ошибка", None
-
-    # Собираем предсказания всех выбранных моделей
     all_predictions = []
-    model_names = []
-    for key in selected_keys:
-        model_data = trained_models[key]
+    for model_name in selected_models:
+        model_data = st.session_state.trained_models[model_name]
         all_predictions.append(model_data['predictions'])
-        model_names.append(key)
 
     all_predictions = np.array(all_predictions)
     n_models = len(all_predictions)
@@ -810,148 +656,104 @@ def ensemble_prediction(data_dict, selected_models_display, threshold, show_nume
     anomaly_votes = np.sum(all_predictions == -1, axis=0)
     anomaly_ratio = anomaly_votes / n_models
 
-    ensemble_labels = (anomaly_ratio >= threshold).astype(int)
-    ensemble_labels = np.where(ensemble_labels == 1, -1, 1)
-
+    ensemble_labels = np.where(anomaly_ratio >= threshold, -1, 1)
     n_anomalies = sum(ensemble_labels == -1)
     anomaly_indices = np.where(ensemble_labels == -1)[0].tolist()
-    anomaly_mask = ensemble_labels == -1
 
-    # Сохраняем результаты для экспорта
     ensemble_results = {
-        'anomaly_mask': anomaly_mask,
+        'anomaly_mask': ensemble_labels == -1,
         'anomaly_indices': anomaly_indices,
-        'selected_keys': selected_keys,
+        'selected_models': selected_models,
         'threshold': threshold,
         'n_anomalies': n_anomalies,
-        'model_names': model_names,
         'n_models': n_models,
         'n_samples': n_samples,
         'anomaly_votes': anomaly_votes,
         'anomaly_ratio': anomaly_ratio
     }
+    st.session_state.ensemble_results = ensemble_results
 
-    # Результат
-    result = f"🎯 Ансамблевое предсказание\n"
-    result += f"{'=' * 50}\n\n"
-    result += f"📊 Участвующие модели ({n_models}):\n"
-    for name in model_names:
-        result += f"   - {name}\n"
-    result += f"\n⚙️ Порог голосования (p): {threshold}\n"
-    result += f"\n📊 Результаты:\n"
-    result += f"   ✅ Нормальные: {n_samples - n_anomalies} ({(n_samples - n_anomalies) / n_samples * 100:.1f}%)\n"
-    result += f"   🔴 Аномалии: {n_anomalies} ({n_anomalies / n_samples * 100:.1f}%)\n"
+    first_model = st.session_state.trained_models[selected_models[0]]
+    X = data_dict['normalized'][first_model['columns']].copy()
 
-    result += f"\n📋 Индексы аномалий (первые 30):\n"
-    if anomaly_indices:
-        result += f"   {anomaly_indices[:30]}"
-        if len(anomaly_indices) > 30:
-            result += f"\n   ... и ещё {len(anomaly_indices) - 30}"
-    else:
-        result += f"   Аномалий не найдено"
-
-    # Статистика голосования
-    vote_distribution = np.bincount(anomaly_votes, minlength=n_models + 1)
-    stats = f"📊 Статистика голосования:\n"
-    stats += f"{'=' * 30}\n"
-    for i in range(n_models + 1):
-        if vote_distribution[i] > 0:
-            stats += f"   {i}/{n_models} алгоритмов: {vote_distribution[i]} образцов ({vote_distribution[i] / n_samples * 100:.1f}%)\n"
-
-    # Визуализация PCA
-    first_model_data = trained_models[selected_keys[0]]
-    model_columns = first_model_data['columns']
-    normalized_df = data_dict['normalized'][model_columns].copy()
-
-    fig_pca, ax = plt.subplots(figsize=(10, 6))
-
-    if normalized_df.shape[1] >= 2:
+    fig_pca, ax = plt.subplots(figsize=(10, 5))
+    if X.shape[1] >= 2:
         pca = PCA(n_components=2)
-        data_2d = pca.fit_transform(normalized_df)
-
+        data_2d = pca.fit_transform(X)
         normal = data_2d[ensemble_labels == 1]
         anomalies = data_2d[ensemble_labels == -1]
 
-        ax.scatter(normal[:, 0], normal[:, 1], c='blue', label=f'Нормальные ({n_samples - n_anomalies})',
-                   alpha=0.6, s=50)
-        ax.scatter(anomalies[:, 0], anomalies[:, 1], c='red', label=f'Аномалии ({n_anomalies})', marker='x',
-                   s=100, linewidths=2, alpha=0.8)
+        anomaly_indices_full = np.where(ensemble_labels == -1)[0]
+        anomaly_labels = X.index[anomaly_indices_full].tolist()
+
+        ax.scatter(normal[:, 0], normal[:, 1], c='blue', label=f'Нормальные ({n_samples - n_anomalies})', alpha=0.4,
+                   s=30)
+
+        for i, (x, y, label) in enumerate(zip(anomalies[:, 0], anomalies[:, 1], anomaly_labels)):
+            ax.scatter(x, y, c='red', marker='x', s=120, linewidths=2, zorder=5)
+            ax.annotate(str(label), (x, y), xytext=(5, 5), textcoords='offset points',
+                        fontsize=9, alpha=0.9, color='darkred', weight='bold',
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.7))
+
+        ax.scatter([], [], c='red', marker='x', s=100, linewidths=2, label=f'Аномалии ({n_anomalies})')
 
         ax.set_xlabel('Первая главная компонента')
         ax.set_ylabel('Вторая главная компонента')
-        ax.set_title(f'Ансамбль ({n_models} моделей), порог p={threshold}')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
     else:
         ax.plot(ensemble_labels, 'o-', markersize=4)
         ax.axhline(y=0, color='red', linestyle='--', linewidth=2)
         ax.fill_between(range(len(ensemble_labels)), -1, 1, where=(ensemble_labels == -1), color='red', alpha=0.3)
+
+        anomaly_indices_full = np.where(ensemble_labels == -1)[0]
+        anomaly_labels = X.index[anomaly_indices_full].tolist()
+
+        for idx, label in zip(anomaly_indices_full, anomaly_labels):
+            ax.annotate(str(label), (idx, -0.5), fontsize=9, alpha=0.9,
+                        color='darkred', rotation=45, ha='right')
+
         ax.set_xlabel('Индекс образца')
         ax.set_ylabel('Предсказание (1=норма, -1=аномалия)')
-        ax.set_title(f'Ансамбль ({n_models} моделей), порог p={threshold}')
-        ax.grid(True, alpha=0.3)
 
+    ax.set_title(f'Ансамбль ({n_models} моделей), порог p={threshold}\nАномалии с подписями (логины школ)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
     plt.tight_layout()
 
-    # Визуализация распределений (если есть аномалии)
     fig_numerical = None
     fig_categorical = None
-
     original_df = data_dict['original']
 
     if n_anomalies > 0:
         if show_numerical:
             numerical_cols = original_df.select_dtypes(include=[np.number]).columns.tolist()
-            if numerical_cols:
-                fig_numerical = plot_numerical_distributions(
-                    original_df, anomaly_indices, numerical_cols
-                )
-            else:
-                fig_numerical = plot_numerical_distributions(original_df, anomaly_indices, [])
-
+            fig_numerical = plot_numerical_distributions(original_df, anomaly_indices, numerical_cols)
         if show_categorical:
-            categorical_cols = original_df.select_dtypes(include=['str', 'object']).columns.tolist()
-            if categorical_cols:
-                fig_categorical = plot_categorical_distributions(
-                    original_df, anomaly_indices, categorical_cols
-                )
-            else:
-                fig_categorical = plot_categorical_distributions(original_df, anomaly_indices, [])
+            categorical_cols = original_df.select_dtypes(include=['object', 'category']).columns.tolist()
+            fig_categorical = plot_categorical_distributions(original_df, anomaly_indices, categorical_cols)
     else:
-        if show_numerical or show_categorical:
-            empty_fig, ax = plt.subplots(figsize=(8, 4))
-            ax.text(0.5, 0.5, "Нет аномалий для визуализации распределений",
-                    ha='center', va='center', fontsize=14)
-            ax.axis('off')
-            plt.tight_layout()
-            if show_numerical:
-                fig_numerical = empty_fig
-            if show_categorical:
-                fig_categorical = empty_fig
+        empty_fig, ax = plt.subplots(figsize=(8, 4))
+        ax.text(0.5, 0.5, "Нет аномалий для визуализации", ha='center', va='center', fontsize=14)
+        ax.axis('off')
+        if show_numerical:
+            fig_numerical = empty_fig
+        if show_categorical:
+            fig_categorical = empty_fig
 
-    status = f"✅ График PCA построен для {n_models} моделей, порог {threshold}"
-    if n_anomalies > 0:
-        status += f", найдено {n_anomalies} аномалий"
-    else:
-        status += f", аномалий не найдено"
-
-    return result, stats, fig_pca, fig_numerical, fig_categorical, status, ensemble_results
+    return fig_pca, fig_numerical, fig_categorical
 
 
-# ========== Функция для экспорта аномалий ==========
-def export_anomalies_to_csv(data_dict, ensemble_results, filename):
-    """Экспортирует аномалии из последнего ансамблевого предсказания"""
+def export_anomalies(data_dict, filename):
+    """Экспортирует аномалии в CSV"""
     if data_dict is None:
-        return None, "❌ Сначала загрузите данные!"
+        return None, "Сначала загрузите данные!"
 
-    if ensemble_results is None:
-        return None, "❌ Сначала выполните ансамблевое предсказание (кнопка 'Выполнить ансамблевое предсказание')!"
+    if st.session_state.ensemble_results is None:
+        return None, "Сначала выполните ансамблевое предсказание!"
 
-    anomaly_mask = ensemble_results.get('anomaly_mask')
-    if anomaly_mask is None or sum(anomaly_mask) == 0:
-        return None, "⚠️ Аномалий не найдено! Нечего экспортировать."
+    anomaly_mask = st.session_state.ensemble_results['anomaly_mask']
+    if sum(anomaly_mask) == 0:
+        return None, "Аномалий не найдено!"
 
-    # Очищаем имя файла от недопустимых символов
     if not filename:
         filename = "anomalies"
     else:
@@ -959,370 +761,456 @@ def export_anomalies_to_csv(data_dict, ensemble_results, filename):
         if not filename:
             filename = "anomalies"
 
-    # Берём исходный датафрейм и фильтруем только аномалии
-    original_df = data_dict['original']
-    anomalies_df = original_df[anomaly_mask].copy()
+    anomalies_df = data_dict['original'][anomaly_mask].copy()
 
-    # Добавляем расширение .csv, если его нет
     if not filename.endswith('.csv'):
         filename += '.csv'
 
-    # Создаём файл во временной директории с заданным именем
     temp_dir = tempfile.gettempdir()
     file_path = os.path.join(temp_dir, filename)
+    anomalies_df.to_csv(file_path, index=True, encoding='utf-8-sig')
 
-    # Сохраняем с включённым индексом
-    anomalies_df.to_csv(file_path, index=True, index_label=original_df.index.name, encoding='utf-8-sig')
-
-    return file_path, f"✅ Экспортировано {sum(anomaly_mask)} аномалий в файл: {filename}"
+    return file_path, f"Экспортировано {sum(anomaly_mask)} аномалий"
 
 
-# ========== Создание интерфейса ==========
-with gr.Blocks(title="Детектор аномалий", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🔍 Система обнаружения аномалий")
-    gr.Markdown("> 💡 **Инструкция:** Загрузите данные → Выберите колонки → Запустите оптимизацию")
+# ==================== ИНТЕРФЕЙС STREAMLIT ====================
+st.set_page_config(page_title="Детектор аномалий", layout="wide")
 
-    data_state = gr.State()
-    ensemble_results_state = gr.State(None)  # Состояние для хранения результатов ансамбля
+st.title("Обнаружение аномалий")
+st.markdown("---")
 
-    with gr.Tabs():
-        # ===== Вкладка 1: Загрузка данных =====
-        with gr.TabItem("📁 Шаг 1: Загрузка данных"):
-            with gr.Row():
-                with gr.Column():
-                    file_input = gr.File(label="CSV файл", file_types=[".csv"])
-                    load_btn = gr.Button("Загрузить и нормализовать", variant="primary")
-                with gr.Column():
-                    info_output = gr.Textbox(label="Информация", lines=10)
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Загрузка данных",
+    "Обучение моделей",
+    "Визуализация",
+    "Ансамбль аномалий",
+    "Кэш моделей"
+])
 
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Исходные данные (первые 5 строк)")
-                    table_output = gr.Dataframe(label="Исходные данные", interactive=False)
-                with gr.Column():
-                    gr.Markdown("### Нормализованные данные (по выбранным колонкам)")
-                    normalized_table_output = gr.Dataframe(label="Нормализованные данные", interactive=False)
+# ========== Вкладка 1: Загрузка данных ==========
+with tab1:
+    col1, col2 = st.columns(2)
+    with col1:
+        uploaded_file = st.file_uploader("CSV файл (кластер)", type=["csv"], key="file_uploader")
 
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Выберите колонки для обучения")
-                    columns_selector = gr.CheckboxGroup(
-                        choices=[],
-                        label="Доступные числовые колонки",
-                        interactive=True
+        if st.button("Загрузить данные", type="primary", key="load_btn"):
+            if st.session_state.current_file_name != uploaded_file.name:
+                clear_all_cache()
+                st.session_state.current_file_name = uploaded_file.name if uploaded_file else None
+                st.rerun()
+
+            with st.spinner("Загрузка..."):
+                data_dict, info, preview = load_cluster_data(uploaded_file)
+                if data_dict is not None:
+                    st.session_state.data_dict = data_dict
+                    st.session_state.loaded = True
+                    st.dataframe(preview, use_container_width=True)
+
+    with col2:
+        if st.session_state.loaded and st.session_state.data_dict is not None:
+            st.markdown("### Выберите колонки для анализа")
+            all_cols = st.session_state.data_dict['all_columns']
+
+            prev_selected = st.session_state.data_dict.get('selected_columns', all_cols)
+            selected_cols = st.multiselect("Числовые колонки", all_cols, default=prev_selected, key="col_selector")
+
+            if selected_cols != prev_selected:
+                st.session_state.trained_models = {}
+                st.session_state.shap_explanations = {}
+                st.session_state.ensemble_results = None
+
+            if selected_cols:
+                st.session_state.data_dict = normalize_data(st.session_state.data_dict, selected_cols)
+                st.dataframe(st.session_state.data_dict['normalized'].head(), use_container_width=True)
+
+
+# ========== Вкладка 2: Обучение моделей ==========
+with tab2:
+    if not st.session_state.loaded or st.session_state.data_dict is None or st.session_state.data_dict.get(
+            'normalized') is None:
+        st.warning("Сначала загрузите данные и выберите колонки на вкладке 1")
+    else:
+        col1, col2 = st.columns([1, 1.5])
+        with col1:
+            st.markdown("### Выбор алгоритма")
+            algorithm = st.selectbox("Алгоритм для оптимизации", [
+                "OneClassSVM", "IsolationForest", "LocalOutlierFactor", "DBSCAN",
+                "AutoEncoder", "KNN", "COPOD", "ECOD"
+            ], key="algo_selector")
+
+            st.markdown("### Параметры оптимизации")
+            n_trials = st.slider("Количество попыток", 10, 100, 30, 5, key="n_trials")
+
+            st.markdown("### Границы доли аномалий")
+            col_a, col_b = st.columns(2)
+            with col_a:
+                borders_low = st.number_input("Нижняя граница", 0.01, 0.2, 0.03, 0.01, key="borders_low")
+            with col_b:
+                borders_high = st.number_input("Верхняя граница", 0.02, 0.3, 0.05, 0.01, key="borders_high")
+            penalty = st.number_input("Штраф", 0, 100, 0, key="penalty")
+
+            st.markdown("### Гиперпараметры для перебора")
+
+            # Параметры для OneClassSVM
+            if algorithm == "OneClassSVM":
+                with st.expander("Доля выбросов (nu)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: nu_min = st.number_input("Минимум", 0.01, 0.2, 0.03, 0.01, key="nu_min", format="%.4f")
+                    with col_b: nu_max = st.number_input("Максимум", 0.01, 0.3, 0.05, 0.01, key="nu_max", format="%.4f")
+                    with col_c: nu_log = st.checkbox("Логарифмический масштаб", False, key="nu_log")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'nu_min': nu_min, 'nu_max': nu_max, 'nu_log': nu_log
+                }
+
+            # Параметры для IsolationForest
+            elif algorithm == "IsolationForest":
+                with st.expander("Количество деревьев (n_estimators)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: n_min = st.number_input("Минимум", 50, 500, 100, 10, key="n_min")
+                    with col_b: n_max = st.number_input("Максимум", 100, 1000, 300, 50, key="n_max")
+                    with col_c: n_log = st.checkbox("Логарифмический масштаб", False, key="n_log")
+
+                with st.expander("Доля выборки (max_samples)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: samples_min = st.number_input("Минимум", 0.5, 0.9, 0.7, 0.05, key="samples_min")
+                    with col_b: samples_max = st.number_input("Максимум", 0.8, 1.0, 1.0, 0.05, key="samples_max")
+                    with col_c: samples_log = st.checkbox("Логарифмический масштаб", False, key="samples_log")
+
+                with st.expander("Доля выбросов (contamination)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: cont_min = st.number_input("Минимум", 0.01, 0.2, 0.03, 0.01, key="cont_min")
+                    with col_b: cont_max = st.number_input("Максимум", 0.02, 0.3, 0.05, 0.01, key="cont_max")
+                    with col_c: cont_log = st.checkbox("Логарифмический масштаб", False, key="cont_log")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'n_min': n_min, 'n_max': n_max, 'n_log': n_log,
+                    'samples_min': samples_min, 'samples_max': samples_max, 'samples_log': samples_log,
+                    'cont_min': cont_min, 'cont_max': cont_max, 'cont_log': cont_log
+                }
+
+            # Параметры для LocalOutlierFactor
+            elif algorithm == "LocalOutlierFactor":
+                with st.expander("Количество соседей (n_neighbors)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: n_min = st.number_input("Минимум", 5, 50, 10, 5, key="n_min")
+                    with col_b: n_max = st.number_input("Максимум", 10, 100, 50, 10, key="n_max")
+                    with col_c: n_log = st.checkbox("Логарифмический масштаб", False, key="n_log")
+
+                with st.expander("Доля выбросов (contamination)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: cont_min = st.number_input("Минимум", 0.01, 0.2, 0.03, 0.01, key="cont_min")
+                    with col_b: cont_max = st.number_input("Максимум", 0.02, 0.3, 0.05, 0.01, key="cont_max")
+                    with col_c: cont_log = st.checkbox("Логарифмический масштаб", False, key="cont_log")
+
+                metric = st.selectbox("Метрика расстояния (metric)", ["minkowski", "euclidean", "manhattan"], key="metric")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'n_min': n_min, 'n_max': n_max, 'n_log': n_log,
+                    'cont_min': cont_min, 'cont_max': cont_max, 'cont_log': cont_log,
+                    'metric': metric
+                }
+
+            # Параметры для DBSCAN
+            elif algorithm == "DBSCAN":
+                with st.expander("Радиус окрестности (eps)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: eps_min = st.number_input("Минимум", 0.5, 1.0, 0.75, 0.05, key="eps_min")
+                    with col_b: eps_max = st.number_input("Максимум", 1.0, 2.0, 1.5, 0.1, key="eps_max")
+                    with col_c: eps_log = st.checkbox("Логарифмический масштаб", False, key="eps_log")
+
+                with st.expander("Минимальное количество точек (min_samples)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: ms_min = st.number_input("Минимум", 5, 20, 7, 1, key="ms_min")
+                    with col_b: ms_max = st.number_input("Максимум", 10, 30, 15, 2, key="ms_max")
+                    with col_c: ms_log = st.checkbox("Логарифмический масштаб", False, key="ms_log")
+
+                metric = st.selectbox("Метрика расстояния (metric)", ["euclidean", "manhattan", "cosine"], key="metric")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'eps_min': eps_min, 'eps_max': eps_max, 'eps_log': eps_log,
+                    'ms_min': ms_min, 'ms_max': ms_max, 'ms_log': ms_log,
+                    'metric': metric
+                }
+
+            # Параметры для AutoEncoder
+            elif algorithm == "AutoEncoder":
+                with st.expander("Скорость обучения (lr)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: lr_min = st.number_input("Минимум", 0.0001, 0.001, 0.0005, 0.0001, format="%.4f", key="lr_min")
+                    with col_b: lr_max = st.number_input("Максимум", 0.001, 0.05, 0.01, 0.005, format="%.4f", key="lr_max")
+                    with col_c: lr_log = st.checkbox("Логарифмический масштаб", True, key="lr_log")
+
+                with st.expander("Количество эпох (epoch_num)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: ep_min = st.number_input("Минимум", 10, 50, 20, 5, key="ep_min")
+                    with col_b: ep_max = st.number_input("Максимум", 20, 100, 50, 10, key="ep_max")
+                    with col_c: ep_log = st.checkbox("Логарифмический масштаб", False, key="ep_log")
+
+                with st.expander("Вероятность dropout (dropout_rate)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: dr_min = st.number_input("Минимум", 0.0, 0.2, 0.0, 0.05, key="dr_min")
+                    with col_b: dr_max = st.number_input("Максимум", 0.1, 0.5, 0.3, 0.1, key="dr_max")
+                    with col_c: dr_log = st.checkbox("Логарифмический масштаб", False, key="dr_log")
+
+                with st.expander("Доля выбросов (contamination)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: cont_min = st.number_input("Минимум", 0.01, 0.2, 0.03, 0.01, key="cont_min")
+                    with col_b: cont_max = st.number_input("Максимум", 0.02, 0.3, 0.05, 0.01, key="cont_max")
+                    with col_c: cont_log = st.checkbox("Логарифмический масштаб", False, key="cont_log")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'lr_min': lr_min, 'lr_max': lr_max, 'lr_log': lr_log,
+                    'ep_min': ep_min, 'ep_max': ep_max, 'ep_log': ep_log,
+                    'dr_min': dr_min, 'dr_max': dr_max, 'dr_log': dr_log,
+                    'cont_min': cont_min, 'cont_max': cont_max, 'cont_log': cont_log
+                }
+
+            # Параметры для KNN
+            elif algorithm == "KNN":
+                with st.expander("Количество соседей (n_neighbors)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: nn_min = st.number_input("Минимум", 3, 15, 5, 1, key="nn_min")
+                    with col_b: nn_max = st.number_input("Максимум", 10, 50, 15, 5, key="nn_max")
+                    with col_c: nn_log = st.checkbox("Логарифмический масштаб", False, key="nn_log")
+
+                with st.expander("Доля выбросов (contamination)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: cont_min = st.number_input("Минимум", 0.01, 0.2, 0.03, 0.01, key="cont_min")
+                    with col_b: cont_max = st.number_input("Максимум", 0.02, 0.3, 0.05, 0.01, key="cont_max")
+                    with col_c: cont_log = st.checkbox("Логарифмический масштаб", False, key="cont_log")
+
+                method = st.selectbox("Метод агрегации (method)", ["largest", "mean", "median"], key="method")
+                metric = st.selectbox("Метрика расстояния (metric)", ["minkowski", "euclidean", "manhattan"], key="metric")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'nn_min': nn_min, 'nn_max': nn_max, 'nn_log': nn_log,
+                    'cont_min': cont_min, 'cont_max': cont_max, 'cont_log': cont_log,
+                    'method': method, 'metric': metric
+                }
+
+            # Параметры для COPOD/ECOD
+            elif algorithm in ["COPOD", "ECOD"]:
+                with st.expander("Доля выбросов (contamination)", expanded=False):
+                    col_a, col_b, col_c = st.columns(3)
+                    with col_a: cont_min = st.number_input("Минимум", 0.01, 0.2, 0.03, 0.01, key="cont_min")
+                    with col_b: cont_max = st.number_input("Максимум", 0.02, 0.3, 0.05, 0.01, key="cont_max")
+                    with col_c: cont_log = st.checkbox("Логарифмический масштаб", False, key="cont_log")
+
+                params_config = {
+                    'n_trials': n_trials,
+                    'borders_low': borders_low,
+                    'borders_high': borders_high,
+                    'penalty': penalty,
+                    'cont_min': cont_min, 'cont_max': cont_max, 'cont_log': cont_log
+                }
+
+            train_btn = st.button("Запустить оптимизацию", type="primary", use_container_width=True, key="train_btn")
+
+        with col2:
+            st.markdown("### Логи оптимизации (обновляются в реальном времени)")
+            log_placeholder = st.empty()
+            result_placeholder = st.empty()
+
+            if train_btn:
+                with st.spinner(f"Оптимизация для {algorithm}..."):
+                    result, best_params, score = run_optimization(
+                        st.session_state.data_dict, algorithm, params_config, log_placeholder
                     )
-                    columns_status = gr.Textbox(label="Статус выбора колонок", value="❌ Загрузите данные",
-                                                interactive=False)
+                    result_placeholder.text_area("Результаты оптимизации", result, height=200, key="result_area")
 
-            load_btn.click(load_data, [file_input],
-                           [data_state, info_output, table_output, normalized_table_output, columns_selector,
-                            columns_status])
-            file_input.change(load_data, [file_input],
-                              [data_state, info_output, table_output, normalized_table_output, columns_selector,
-                               columns_status])
-            columns_selector.change(update_selected_columns, [data_state, columns_selector],
-                                    [data_state, columns_status, normalized_table_output])
 
-        # ===== Вкладка 2: Оптимизация (Optuna) =====
-        with gr.TabItem("🎯 Шаг 2: Оптимизация гиперпараметров"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### Выбор алгоритма")
-                    optuna_algorithm = gr.Radio(
-                        choices=["OneClassSVM", "IsolationForest", "LocalOutlierFactor"],
-                        label="Алгоритм для оптимизации",
-                        value="OneClassSVM"
+# ========== Вкладка 3: Визуализация ==========
+with tab3:
+    if not st.session_state.trained_models:
+        st.info("Сначала обучите модели на вкладке 2")
+    else:
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            models_list = get_trained_models_list()
+            selected_model = st.selectbox("Выберите модель", models_list, key="model_select")
+
+            plot_type = st.radio("Тип графика",
+                                 ["PCA", "Score Plot", "SHAP Summary", "SHAP Decision", "SHAP Heatmap"],
+                                 key="plot_type")
+
+            summary_type = "dot"
+            if plot_type == "SHAP Summary":
+                summary_type = st.radio("Тип summary графика", ["dot", "bar", "violin"], key="summary_type")
+
+            plot_btn = st.button("Построить график", type="primary", use_container_width=True, key="plot_btn")
+
+        with col2:
+            plot_placeholder = st.empty()
+
+            if plot_btn:
+                with st.spinner("Строим график..."):
+                    fig, msg = create_plot(st.session_state.data_dict, selected_model, plot_type, summary_type)
+                    if fig is not None:
+                        plot_placeholder.pyplot(fig)
+                    elif msg:
+                        st.error(msg)
+
+
+# ========== Вкладка 4: Ансамбль аномалий ==========
+with tab4:
+    if not st.session_state.trained_models:
+        st.info("Сначала обучите модели на вкладке 2")
+    else:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            models_list = get_trained_models_list()
+            selected_models = st.multiselect("Выберите модели для ансамбля", models_list, key="ensemble_models")
+
+            threshold = st.slider("Порог голосования (p)", 0.0, 1.0, 0.5, 0.05, key="threshold")
+
+            st.markdown("### Визуализация распределений")
+            show_numerical = st.checkbox("Показать числовые признаки", True, key="show_numerical")
+            show_categorical = st.checkbox("Показать категориальные признаки", True, key="show_categorical")
+
+            ensemble_btn = st.button("Выполнить ансамбль", type="primary", use_container_width=True, key="ensemble_btn")
+
+            st.markdown("---")
+            st.markdown("### Экспорт результатов")
+            export_filename = st.text_input("Имя файла", "anomalies", key="export_filename")
+
+            # Кнопка скачивания здесь
+            if st.session_state.ensemble_results is not None:
+                anomaly_mask = st.session_state.ensemble_results['anomaly_mask']
+                if sum(anomaly_mask) > 0:
+                    anomalies_df = st.session_state.data_dict['original'][anomaly_mask].copy()
+                    csv_data = anomalies_df.to_csv(index=True, encoding='utf-8-sig')
+                    st.download_button(
+                        label="Скачать CSV",
+                        data=csv_data,
+                        file_name=f"{export_filename}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key="export_btn"
                     )
-
-                    gr.Markdown("### Параметры оптимизации")
-                    n_trials = gr.Slider(10, 200, 50, 10, label="Количество попыток (n_trials)")
-
-                    gr.Markdown("### Границы доли аномалий (borders)")
-                    with gr.Row():
-                        borders_low = gr.Number(value=0.03, label="Нижняя граница", precision=2, step=0.01)
-                        borders_high = gr.Number(value=0.05, label="Верхняя граница", precision=2, step=0.01)
-                    penalty = gr.Number(value=0, label="Штраф при выходе за границы", precision=0)
-
-                    gr.Markdown("### Гиперпараметры для перебора")
-
-                    with gr.Group(visible=True) as optuna_svm_params:
-                        gr.Markdown("#### OneClass SVM")
-                        with gr.Row():
-                            svm_nu_min = gr.Number(value=0.03, label="nu min", precision=2, step=0.01)
-                            svm_nu_max = gr.Number(value=0.05, label="nu max", precision=2, step=0.01)
-                        svm_nu_log = gr.Checkbox(label="Логарифмический масштаб", value=False)
-
-                    with gr.Group(visible=False) as optuna_iforest_params:
-                        gr.Markdown("#### Isolation Forest")
-                        with gr.Row():
-                            iforest_n_min = gr.Number(value=50, label="n_estimators min", precision=0)
-                            iforest_n_max = gr.Number(value=300, label="n_estimators max", precision=0)
-                        iforest_n_log = gr.Checkbox(label="Логарифмический масштаб", value=False)
-
-                        with gr.Row():
-                            iforest_cont_min = gr.Number(value=0.03, label="contamination min", precision=2, step=0.01)
-                            iforest_cont_max = gr.Number(value=0.05, label="contamination max", precision=2, step=0.01)
-                        iforest_cont_log = gr.Checkbox(label="Логарифмический масштаб", value=False)
-
-                        with gr.Row():
-                            iforest_samples_min = gr.Number(value=0.5, label="max_samples min", precision=2, step=0.05)
-                            iforest_samples_max = gr.Number(value=1.0, label="max_samples max", precision=2, step=0.05)
-                        iforest_samples_log = gr.Checkbox(label="Логарифмический масштаб", value=False)
-
-                    with gr.Group(visible=False) as optuna_lof_params:
-                        gr.Markdown("#### Local Outlier Factor")
-                        with gr.Row():
-                            lof_neighbors_min = gr.Number(value=5, label="n_neighbors min", precision=0)
-                            lof_neighbors_max = gr.Number(value=50, label="n_neighbors max", precision=0)
-                        lof_neighbors_log = gr.Checkbox(label="Логарифмический масштаб", value=False)
-
-                        with gr.Row():
-                            lof_cont_min = gr.Number(value=0.03, label="contamination min", precision=2, step=0.01)
-                            lof_cont_max = gr.Number(value=0.05, label="contamination max", precision=2, step=0.01)
-                        lof_cont_log = gr.Checkbox(label="Логарифмический масштаб", value=False)
-
-                    optimize_btn = gr.Button("🚀 Запустить оптимизацию", variant="primary", size="lg")
-
-                with gr.Column(scale=1):
-                    gr.Markdown("### Результаты оптимизации")
-                    optuna_result = gr.Textbox(label="Детали", lines=12)
-                    best_params_display = gr.Textbox(label="Лучшие параметры", lines=6)
-                    best_score = gr.Number(label="Лучшая метрика", interactive=False)
-                    optuna_logs = gr.Textbox(label="Логи Optuna (пошагово)", lines=15, interactive=False)
-
-
-            def update_optuna_visibility(algo):
-                return [
-                    gr.update(visible=(algo == "OneClassSVM")),
-                    gr.update(visible=(algo == "IsolationForest")),
-                    gr.update(visible=(algo == "LocalOutlierFactor"))
-                ]
-
-
-            optuna_algorithm.change(update_optuna_visibility, optuna_algorithm,
-                                    [optuna_svm_params, optuna_iforest_params, optuna_lof_params])
-
-
-            def update_logs(logs):
-                return logs
-
-
-            def run_optimization_wrapper(
-                    data_dict, algorithm, n_trials, bl, bh, p,
-                    svm_nu_min, svm_nu_max, svm_nu_log,
-                    if_n_min, if_n_max, if_n_log,
-                    if_c_min, if_c_max, if_c_log,
-                    if_s_min, if_s_max, if_s_log,
-                    lof_n_min, lof_n_max, lof_n_log,
-                    lof_c_min, lof_c_max, lof_c_log
-            ):
-                if bl >= bh:
-                    return "❌ Ошибка: нижняя граница borders должна быть меньше верхней!", None, None, ""
-
-                if algorithm == "OneClassSVM":
-                    params = {
-                        'nu': ((svm_nu_min, svm_nu_max), float, svm_nu_log)
-                    }
-                    cls = OneClassSVM
-
-                elif algorithm == "IsolationForest":
-                    params = {
-                        'n_estimators': ((int(if_n_min), int(if_n_max)), int, if_n_log),
-                        'contamination': ((if_c_min, if_c_max), float, if_c_log),
-                        'max_samples': ((if_s_min, if_s_max), float, if_s_log),
-                        'n_jobs': -1,
-                        'random_state': 42
-                    }
-                    cls = IsolationForest
-
                 else:
-                    params = {
-                        'n_neighbors': ((int(lof_n_min), int(lof_n_max)), int, lof_n_log),
-                        'contamination': ((lof_c_min, lof_c_max), float, lof_c_log),
-                        'n_jobs': -1
-                    }
-                    cls = LocalOutlierFactor
+                    st.info("Аномалий не найдено - нечего экспортировать")
+            else:
+                st.info("Сначала выполните ансамблевое предсказание")
 
-                return run_optimization(
-                    data_dict, cls, int(n_trials), bl, bh, p, update_logs, **params
-                )
+        with st.container():
+            st.markdown("### Визуализация аномалий (PCA)")
+            ensemble_plot = st.empty()
 
+            st.markdown("### Распределение числовых признаков")
+            numerical_plot = st.empty()
 
-            optimize_btn.click(
-                run_optimization_wrapper,
-                inputs=[data_state, optuna_algorithm, n_trials, borders_low, borders_high, penalty,
-                        svm_nu_min, svm_nu_max, svm_nu_log,
-                        iforest_n_min, iforest_n_max, iforest_n_log,
-                        iforest_cont_min, iforest_cont_max, iforest_cont_log,
-                        iforest_samples_min, iforest_samples_max, iforest_samples_log,
-                        lof_neighbors_min, lof_neighbors_max, lof_neighbors_log,
-                        lof_cont_min, lof_cont_max, lof_cont_log],
-                outputs=[optuna_result, best_params_display, best_score, optuna_logs]
-            )
+            st.markdown("### Распределение категориальных признаков")
+            categorical_plot = st.empty()
 
-        # ===== Вкладка 3: Предсказания =====
-        with gr.TabItem("📊 Шаг 3: Предсказания"):
-            with gr.Row():
-                with gr.Column():
-                    predict_selector = gr.Dropdown([], label="Доступные модели")
-                    refresh_predict = gr.Button("🔄 Обновить список", variant="secondary")
-                    predict_status = gr.Textbox("📭 Нет обученных моделей", label="Статус")
-                    predict_btn = gr.Button("🔮 Получить предсказания", variant="primary")
-                with gr.Column():
-                    predict_result = gr.Textbox(label="Результаты предсказания", lines=25)
+        if 'ensemble_fig_pca' not in st.session_state:
+            st.session_state.ensemble_fig_pca = None
+        if 'ensemble_fig_num' not in st.session_state:
+            st.session_state.ensemble_fig_num = None
+        if 'ensemble_fig_cat' not in st.session_state:
+            st.session_state.ensemble_fig_cat = None
 
-            refresh_predict.click(refresh_predict_models, None, [predict_selector, predict_status])
-            predict_btn.click(get_predictions_from_selected_model, [data_state, predict_selector], predict_result)
-
-        # ===== Вкладка 4: Визуализация =====
-        with gr.TabItem("📈 Шаг 4: Визуализация"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    plot_selector = gr.Dropdown([], label="Доступные модели")
-                    refresh_plot = gr.Button("🔄 Обновить список", variant="secondary")
-                    plot_status = gr.Textbox("📭 Нет обученных моделей", label="Статус")
-
-                    gr.Markdown("### Тип визуализации")
-                    plot_type = gr.Radio(
-                        choices=["PCA", "Score Plot", "SHAP Summary", "SHAP Decision", "SHAP Heatmap"],
-                        label="Выберите тип графика",
-                        value="PCA"
+        if ensemble_btn:
+            if not selected_models:
+                st.error("Выберите хотя бы одну модель для ансамбля!")
+            else:
+                with st.spinner("Выполняется ансамбль..."):
+                    # Изменяем вызов - убираем stats
+                    fig_pca, fig_num, fig_cat = ensemble_prediction(
+                        st.session_state.data_dict, selected_models, threshold, show_numerical, show_categorical
                     )
 
-                    # Группа для параметров SHAP Summary (скрыта по умолчанию)
-                    with gr.Group(visible=False) as shap_summary_group:
-                        summary_plot_type = gr.Radio(
-                            choices=["dot", "bar", "violin"],
-                            label="Тип summary plot",
-                            value="dot"
-                        )
+                    st.session_state.ensemble_fig_pca = fig_pca
+                    st.session_state.ensemble_fig_num = fig_num
+                    st.session_state.ensemble_fig_cat = fig_cat
 
-                    plot_btn = gr.Button("📈 Построить график", variant="primary")
+                    ensemble_plot.pyplot(fig_pca)
+                    if fig_num:
+                        numerical_plot.pyplot(fig_num)
+                    if fig_cat:
+                        categorical_plot.pyplot(fig_cat)
 
-                with gr.Column(scale=1):
-                    plot_output = gr.Plot(label="Визуализация")
-                    plot_result = gr.Textbox(label="Результат", lines=3)
+                st.rerun()
 
-            refresh_plot.click(refresh_plot_models, None, [plot_selector, plot_status])
-
-
-            def update_summary_visibility(plot_type_val):
-                return gr.update(visible=(plot_type_val == "SHAP Summary"))
-
-
-            plot_type.change(update_summary_visibility, plot_type, shap_summary_group)
+        if st.session_state.ensemble_fig_pca is not None and not ensemble_btn:
+            ensemble_plot.pyplot(st.session_state.ensemble_fig_pca)
+        if st.session_state.ensemble_fig_num is not None and not ensemble_btn:
+            numerical_plot.pyplot(st.session_state.ensemble_fig_num)
+        if st.session_state.ensemble_fig_cat is not None and not ensemble_btn:
+            categorical_plot.pyplot(st.session_state.ensemble_fig_cat)
 
 
-            def create_plot_wrapper(data_dict, selected_model, plot_type_val, summary_type):
-                if plot_type_val == "PCA":
-                    return create_pca_plot(data_dict, selected_model)
-                elif plot_type_val == "Score Plot":
-                    return create_score_plot(data_dict, selected_model)
-                else:
-                    shap_type = {
-                        "SHAP Summary": "summary",
-                        "SHAP Decision": "decision",
-                        "SHAP Heatmap": "heatmap"
-                    }.get(plot_type_val, "summary")
-                    return create_shap_plot(data_dict, selected_model, shap_type, summary_type)
+# ========== Вкладка 5: Кэш моделей ==========
+with tab5:
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Показать все модели", key="show_models_btn"):
+            if not st.session_state.trained_models:
+                st.info("Кэш пуст")
+            else:
+                for name, data in st.session_state.trained_models.items():
+                    with st.expander(f"Модель {name}"):
+                        st.write("**Гиперпараметры:**")
+                        for k, v in data['params'].items():
+                            # Переводим названия параметров на русский
+                            param_names = {
+                                'nu': 'Доля выбросов',
+                                'n_estimators': 'Количество деревьев',
+                                'max_samples': 'Доля выборки',
+                                'contamination': 'Доля выбросов',
+                                'n_neighbors': 'Количество соседей',
+                                'metric': 'Метрика расстояния',
+                                'eps': 'Радиус окрестности',
+                                'min_samples': 'Мин. точек в окрестности',
+                                'lr': 'Скорость обучения',
+                                'epoch_num': 'Количество эпох',
+                                'dropout_rate': 'Вероятность dropout',
+                                'method': 'Метод агрегации'
+                            }
+                            param_name = param_names.get(k, k)
+                            st.write(f"   - {param_name}: {v}")
+                        st.write(f"**Колонки:** {data['columns'][:5]}...")
+                        st.write(f"**Аномалий:** {data['n_anomalies']} ({data['n_anomalies'] / len(st.session_state.data_dict['normalized']) * 100:.1f}%)")
+                        st.write(f"**Метрика:** {data['score']:.4f}")
 
+        if st.button("Показать SHAP кэш", key="show_shap_btn"):
+            if not st.session_state.shap_explanations:
+                st.info("SHAP кэш пуст")
+            else:
+                for name in st.session_state.shap_explanations.keys():
+                    st.write(f"SHAP значения для: {name}")
 
-            plot_btn.click(
-                create_plot_wrapper,
-                [data_state, plot_selector, plot_type, summary_plot_type],
-                [plot_output, plot_result]
-            )
+    with col2:
+        if st.button("Очистить кэш моделей", type="secondary", key="clear_models_btn"):
+            st.session_state.trained_models = {}
+            st.session_state.shap_explanations = {}
+            st.session_state.ensemble_results = None
+            st.success("Кэш моделей очищен")
 
-        # ===== Вкладка 5: Управление кэшем =====
-        with gr.TabItem("🗂️ Шаг 5: Кэш"):
-            with gr.Row():
-                with gr.Column():
-                    show_btn = gr.Button("👁️ Показать все модели", variant="secondary")
-                    cache_info = gr.Textbox(label="Информация о кэше", lines=15)
-                    clear_btn = gr.Button("🗑️ Очистить кэш", variant="stop")
-                    clear_result = gr.Textbox(label="Результат очистки", lines=3)
-
-            show_btn.click(show_cached_models, None, cache_info)
-            clear_btn.click(clear_cache, None, clear_result)
-
-        # ===== Вкладка 6: Ансамбль аномалий =====
-        with gr.TabItem("🎯 Шаг 6: Ансамбль аномалий"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### Выберите модели для ансамбля")
-                    gr.Markdown("> 💡 Алгоритмы, которые будут участвовать в голосовании")
-
-                    available_models = gr.CheckboxGroup(
-                        choices=[],
-                        label="Доступные модели",
-                        interactive=True
-                    )
-
-                    refresh_ensemble_btn = gr.Button("🔄 Обновить список моделей", variant="secondary")
-
-                    gr.Markdown("### Параметры голосования")
-                    p_threshold = gr.Slider(
-                        0.0, 1.0, 0.5, 0.05,
-                        label="Порог голосования (p)",
-                        info="Объект считается аномалией, если доля алгоритмов, определивших его как аномалию, >= p"
-                    )
-
-                    gr.Markdown("### Визуализация распределений аномалий")
-                    show_numerical = gr.Checkbox(label="Показать гистограммы числовых признаков", value=True)
-                    show_categorical = gr.Checkbox(label="Показать столбчатые диаграммы категориальных признаков",
-                                                   value=True)
-
-                    ensemble_predict_btn = gr.Button("🔮 Выполнить ансамблевое предсказание", variant="primary",
-                                                     size="lg")
-
-                    gr.Markdown("### Экспорт результатов")
-                    export_filename = gr.Textbox(
-                        label="Имя файла для экспорта",
-                        placeholder="anomalies (без расширения или с .csv)",
-                        value="anomalies"
-                    )
-                    export_btn = gr.Button("📥 Скачать аномалии (CSV)", variant="secondary")
-                    export_file = gr.File(label="Скачать CSV", visible=True)
-                    export_status = gr.Textbox(label="Статус экспорта", lines=2, interactive=False)
-
-                with gr.Column(scale=1):
-                    ensemble_result = gr.Textbox(label="Результаты ансамбля", lines=12)
-                    ensemble_stats = gr.Textbox(label="Статистика", lines=5)
-
-            # PCA график - первый
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Визуализация аномалий (PCA)")
-                    ensemble_plot = gr.Plot(label="Аномалии по результатам голосования")
-                    ensemble_plot_status = gr.Textbox(label="Статус PCA", lines=2, interactive=False)
-
-            # Числовые распределения - второй блок (под PCA)
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Распределение числовых признаков среди аномалий")
-                    numerical_plot = gr.Plot(label="Гистограммы числовых признаков")
-
-            # Категориальные распределения - третий блок (под числовыми)
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### Распределение категориальных признаков среди аномалий")
-                    categorical_plot = gr.Plot(label="Столбчатые диаграммы категориальных признаков")
-
-            refresh_ensemble_btn.click(refresh_ensemble_models, None, [available_models, ensemble_stats])
-
-            ensemble_predict_btn.click(
-                ensemble_prediction,
-                inputs=[data_state, available_models, p_threshold, show_numerical, show_categorical],
-                outputs=[ensemble_result, ensemble_stats, ensemble_plot, numerical_plot, categorical_plot,
-                         ensemble_plot_status, ensemble_results_state]
-            )
-
-            # Экспорт аномалий с пользовательским именем (использует сохранённые результаты)
-            export_btn.click(
-                export_anomalies_to_csv,
-                inputs=[data_state, ensemble_results_state, export_filename],
-                outputs=[export_file, export_status]
-            )
-
-if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860)
+        if st.button("Очистить SHAP кэш", type="secondary", key="clear_shap_btn"):
+            st.session_state.shap_explanations = {}
+            st.success("SHAP кэш очищен")
